@@ -79,6 +79,11 @@ slices and combining with `JacobianLens.merge()`.
 model, load (or fit) a lens, apply it at a few layers, and render a slice page
 like the one above.
 
+For replaying saved tau2-bench tool-agent failures, see
+[`TAU2_ANALYSIS.md`](TAU2_ANALYSIS.md). The included CLI reconstructs the exact
+logged chat template and compares expected and emitted tool names layer by
+layer.
+
 Reading a slice page:
 
 - Each cell shows the lens top-1 word at that (position, layer); the
