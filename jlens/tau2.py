@@ -62,6 +62,8 @@ class LoggedCall:
 
     path: Path
     data: JSONDict
+    call_index: int = -1
+    turn_index: int | None = None
 
     @property
     def actual_tools(self) -> tuple[str, ...]:
@@ -75,6 +77,56 @@ class RenderedCall:
 
     text: str
     token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FailureEvent:
+    """Conservatively localized first externally verifiable error."""
+
+    call_index: int | None
+    turn_index: int | None
+    kind: str
+    source: str
+    confidence: Literal["verified", "reviewed", "terminal", "unlocalized"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class GeneratedSpan:
+    """One generated tool-name or argument-value token span."""
+
+    kind: Literal["tool_name", "argument_value"]
+    label: str
+    start: int
+    end: int
+    token_ids: tuple[int, ...]
+
+    @property
+    def prediction_positions(self) -> tuple[int, ...]:
+        """Positions whose next-token logits predict this span."""
+        if self.start < 1:
+            raise ValueError(f"{self.kind} span has no preceding token")
+        return tuple(range(self.start - 1, self.end - 1))
+
+
+@dataclass(frozen=True)
+class SemanticBoundary:
+    """A semantic source position in a reconstructed request or response."""
+
+    name: str
+    context: Literal["request", "response", "update"]
+    position: int
+    label: str | None = None
+
+
+@dataclass(frozen=True)
+class ReplayedResponse:
+    """Exact pre-response request plus the logged response under teacher forcing."""
+
+    request: RenderedCall
+    response: RenderedCall
+    boundaries: tuple[SemanticBoundary, ...]
+    generated_spans: tuple[GeneratedSpan, ...]
 
 
 @dataclass(frozen=True)
@@ -157,6 +209,51 @@ def _tool_names(tool_calls: Sequence[Any]) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _tool_arguments(tool_call: Mapping[str, Any]) -> JSONDict | None:
+    arguments: Any = tool_call.get("arguments")
+    function = tool_call.get("function")
+    if arguments is None and isinstance(function, Mapping):
+        arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+    return dict(arguments) if isinstance(arguments, Mapping) else None
+
+
+def _tool_call_id(tool_call: Mapping[str, Any]) -> str | None:
+    value = tool_call.get("id")
+    return str(value) if value is not None else None
+
+
+def _assistant_messages(simulation: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [
+        message
+        for message in simulation.get("messages") or []
+        if isinstance(message, Mapping) and message.get("role") == "assistant"
+    ]
+
+
+def _normalized_content(value: Any) -> str:
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value).strip()
+    return str(value or "").strip()
+
+
+def _call_matches_message(call: LoggedCall, message: Mapping[str, Any]) -> bool:
+    response = call.data.get("response") or {}
+    if not isinstance(response, Mapping):
+        return False
+    response_tools = _tool_names(response.get("tool_calls") or [])
+    message_tools = _tool_names(message.get("tool_calls") or [])
+    if response_tools or message_tools:
+        return response_tools == message_tools
+    return _normalized_content(response.get("content")) == _normalized_content(
+        message.get("content")
+    )
+
+
 def _actual_tools(simulation: Mapping[str, Any]) -> tuple[str, ...]:
     names: list[str] = []
     for message in simulation.get("messages") or []:
@@ -212,6 +309,270 @@ def load_cases(path: str | Path) -> list[Tau2Case]:
     return cases
 
 
+def _tool_schemas(call: LoggedCall) -> dict[str, Mapping[str, Any]]:
+    request = call.data.get("request") or {}
+    schemas: dict[str, Mapping[str, Any]] = {}
+    for tool in request.get("tools") or []:
+        if not isinstance(tool, Mapping):
+            continue
+        function = tool.get("function")
+        definition = function if isinstance(function, Mapping) else tool
+        name = definition.get("name")
+        if isinstance(name, str):
+            schemas[name] = definition
+    return schemas
+
+
+def _matches_json_type(value: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_matches_json_type(value, item) for item in expected)
+    types: dict[str, type[Any] | tuple[type[Any], ...]] = {
+        "object": Mapping,
+        "array": list,
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "null": type(None),
+    }
+    python_type = types.get(str(expected))
+    if python_type is None:
+        return True
+    if expected in {"integer", "number"} and isinstance(value, bool):
+        return False
+    return isinstance(value, python_type)
+
+
+def _schema_error(call: LoggedCall) -> str | None:
+    """Return a conservative, locally verifiable tool-call schema error."""
+    schemas = _tool_schemas(call)
+    response = call.data.get("response") or {}
+    if not isinstance(response, Mapping):
+        return "response is not an object"
+    for tool_call in response.get("tool_calls") or []:
+        if not isinstance(tool_call, Mapping):
+            return "tool call is not an object"
+        name = _tool_name(tool_call)
+        if name is None:
+            return "tool call has no function name"
+        if name not in schemas:
+            return f"emitted unknown tool {name!r}"
+        arguments = _tool_arguments(tool_call)
+        if arguments is None:
+            function = tool_call.get("function")
+            raw_arguments = tool_call.get("arguments")
+            if raw_arguments is None and isinstance(function, Mapping):
+                raw_arguments = function.get("arguments")
+            if raw_arguments is None:
+                arguments = {}
+            else:
+                return f"arguments for {name!r} are not a JSON object"
+        parameters = schemas[name].get("parameters") or {}
+        if not isinstance(parameters, Mapping):
+            continue
+        required = parameters.get("required") or []
+        missing = [key for key in required if key not in arguments]
+        if missing:
+            return f"{name!r} is missing required arguments {missing!r}"
+        properties = parameters.get("properties") or {}
+        if isinstance(properties, Mapping):
+            for key, value in arguments.items():
+                definition = properties.get(key)
+                if isinstance(definition, Mapping) and not _matches_json_type(
+                    value, definition.get("type")
+                ):
+                    return (
+                        f"argument {key!r} for {name!r} violates type "
+                        f"{definition.get('type')!r}"
+                    )
+        if parameters.get("additionalProperties") is False:
+            extras = sorted(set(arguments) - set(properties))
+            if extras:
+                return f"{name!r} has unsupported arguments {extras!r}"
+    return None
+
+
+def _tool_error_ids(simulation: Mapping[str, Any]) -> set[str]:
+    error_ids: set[str] = set()
+    for message in simulation.get("messages") or []:
+        if not isinstance(message, Mapping) or message.get("role") != "tool":
+            continue
+        if message.get("error") is True and message.get("id") is not None:
+            error_ids.add(str(message["id"]))
+    return error_ids
+
+
+def _call_has_tool_error(call: LoggedCall, error_ids: set[str]) -> bool:
+    response = call.data.get("response") or {}
+    if not isinstance(response, Mapping):
+        return False
+    return any(
+        isinstance(tool_call, Mapping)
+        and (call_id := _tool_call_id(tool_call)) is not None
+        and call_id in error_ids
+        for tool_call in response.get("tool_calls") or []
+    )
+
+
+def _review_error(case: Tau2Case, calls: Sequence[LoggedCall]) -> FailureEvent | None:
+    review = case.simulation.get("review") or {}
+    if not isinstance(review, Mapping):
+        return None
+    errors = []
+    for error in review.get("errors") or []:
+        if not isinstance(error, Mapping) or error.get("source") != "agent":
+            continue
+        turn_index = error.get("turn_idx")
+        if isinstance(turn_index, int):
+            errors.append((turn_index, error))
+    if not errors:
+        return None
+    turn_index, error = min(errors, key=lambda item: item[0])
+    matched = next((call for call in calls if call.turn_index == turn_index), None)
+    if matched is None:
+        matched = next(
+            (
+                call
+                for call in calls
+                if call.turn_index is not None and call.turn_index >= turn_index
+            ),
+            None,
+        )
+    if matched is None:
+        return None
+    reason = error.get("reasoning") or error.get("error_type") or "reviewer error"
+    return FailureEvent(
+        call_index=matched.call_index,
+        turn_index=matched.turn_index,
+        kind=str(error.get("error_type") or "reviewed_agent_error"),
+        source="tau2_review",
+        confidence="reviewed",
+        reason=str(reason),
+    )
+
+
+def _manual_error(
+    calls: Sequence[LoggedCall], label: Mapping[str, Any]
+) -> FailureEvent:
+    matched: LoggedCall | None = None
+    if isinstance(label.get("call_index"), int):
+        matched = next(
+            (call for call in calls if call.call_index == label["call_index"]), None
+        )
+    if matched is None and label.get("call_id") is not None:
+        call_id = str(label["call_id"])
+        matched = next(
+            (
+                call
+                for call in calls
+                if str(call.data.get("call_id", call.path.stem)) == call_id
+            ),
+            None,
+        )
+    if matched is None and isinstance(label.get("turn_index"), int):
+        matched = next(
+            (call for call in calls if call.turn_index == label["turn_index"]), None
+        )
+    if matched is None:
+        raise ValueError("manual first-error label does not identify a saved agent call")
+    return FailureEvent(
+        call_index=matched.call_index,
+        turn_index=matched.turn_index,
+        kind=str(label.get("kind") or "manually_audited_error"),
+        source="manual_label",
+        confidence="verified",
+        reason=str(label.get("reason") or "manually audited first error"),
+    )
+
+
+def infer_first_error(
+    case: Tau2Case,
+    calls: Sequence[LoggedCall],
+    *,
+    manual_label: Mapping[str, Any] | None = None,
+    allow_review_labels: bool = True,
+) -> FailureEvent | None:
+    """Locate the earliest defensible failure without forcing ambiguous cases."""
+    if not case.failed:
+        return None
+    if manual_label is not None:
+        return _manual_error(calls, manual_label)
+
+    verified: list[FailureEvent] = []
+    error_ids = _tool_error_ids(case.simulation)
+    for call in calls:
+        if (reason := _schema_error(call)) is not None:
+            verified.append(
+                FailureEvent(
+                    call_index=call.call_index,
+                    turn_index=call.turn_index,
+                    kind="tool_schema_error",
+                    source="logged_request_schema",
+                    confidence="verified",
+                    reason=reason,
+                )
+            )
+        if _call_has_tool_error(call, error_ids):
+            verified.append(
+                FailureEvent(
+                    call_index=call.call_index,
+                    turn_index=call.turn_index,
+                    kind="tool_execution_error",
+                    source="tau2_tool_result",
+                    confidence="verified",
+                    reason="tau2 recorded error=true for a tool result from this call",
+                )
+            )
+    if verified:
+        return min(
+            verified,
+            key=lambda event: event.call_index
+            if event.call_index is not None
+            else len(calls),
+        )
+
+    if allow_review_labels and (reviewed := _review_error(case, calls)) is not None:
+        return reviewed
+
+    reward_info = case.simulation.get("reward_info") or {}
+    action_checks = (
+        reward_info.get("action_checks") if isinstance(reward_info, Mapping) else None
+    )
+    db_check = reward_info.get("db_check") if isinstance(reward_info, Mapping) else None
+    missing_action = any(
+        isinstance(check, Mapping) and check.get("action_match") is False
+        for check in action_checks or []
+    )
+    db_diverged = isinstance(db_check, Mapping) and db_check.get("db_match") is False
+    termination_reason = str(case.simulation.get("termination_reason") or "")
+    if calls and missing_action and not db_diverged and termination_reason in {
+        "agent_stop",
+        "max_steps",
+        "timeout",
+    }:
+        last = calls[-1]
+        return FailureEvent(
+            call_index=last.call_index,
+            turn_index=last.turn_index,
+            kind="premature_termination",
+            source="tau2_completion_checks",
+            confidence="terminal",
+            reason="agent terminated with required actions still unsatisfied",
+        )
+
+    return FailureEvent(
+        call_index=None,
+        turn_index=None,
+        kind="unlocalized_failure",
+        source="tau2_end_state",
+        confidence="unlocalized",
+        reason=(
+            "the end-state reward proves failure, but saved artifacts do not "
+            "conservatively identify the first erroneous call"
+        ),
+    )
+
+
 def select_cases(
     cases: Sequence[Tau2Case],
     *,
@@ -243,6 +604,25 @@ def select_calls(
     raise ValueError(f"unknown call selection {selection!r}")
 
 
+def select_event_calls(
+    calls: Sequence[LoggedCall],
+    anchor_index: int | None,
+    *,
+    before: int | None = None,
+    after: int = 1,
+) -> list[LoggedCall]:
+    """Select a first-error window; ``before=None`` retains all prior calls."""
+    if after < 0:
+        raise ValueError("event window after must be non-negative")
+    if before is not None and before < 0:
+        raise ValueError("event window before must be non-negative or None")
+    if anchor_index is None:
+        return list(calls)
+    start = 0 if before is None else max(0, anchor_index - before)
+    stop = min(len(calls), anchor_index + after + 1)
+    return [call for call in calls if start <= call.call_index < stop]
+
+
 def candidate_tool_names(case: Tau2Case, call: LoggedCall) -> tuple[str, ...]:
     """Return unmet expected tools followed by tools emitted in this call."""
     expected = case.remaining_expected_tools or case.expected_tools
@@ -258,11 +638,34 @@ def discover_agent_calls(run_dir: str | Path, case: Tau2Case) -> list[LoggedCall
         / f"sim_{case.simulation_id}"
         / "llm_debug"
     )
-    calls = []
+    raw_calls = []
     for path in sorted(log_dir.glob("*.json")):
         data = _read_json(path)
         if data.get("call_name") in AGENT_CALL_NAMES:
-            calls.append(LoggedCall(path=path, data=data))
+            raw_calls.append(LoggedCall(path=path, data=data))
+
+    assistant_messages = _assistant_messages(case.simulation)
+    calls: list[LoggedCall] = []
+    message_cursor = 0
+    for call_index, call in enumerate(raw_calls):
+        matched: Mapping[str, Any] | None = None
+        for message_index in range(message_cursor, len(assistant_messages)):
+            message = assistant_messages[message_index]
+            if _call_matches_message(call, message):
+                matched = message
+                message_cursor = message_index + 1
+                break
+        turn_index = None
+        if matched is not None and isinstance(matched.get("turn_idx"), int):
+            turn_index = int(matched["turn_idx"])
+        calls.append(
+            LoggedCall(
+                path=call.path,
+                data=call.data,
+                call_index=call_index,
+                turn_index=turn_index,
+            )
+        )
     return calls
 
 
@@ -313,6 +716,237 @@ def render_logged_call(
     if not isinstance(text, str):
         raise TypeError("chat template did not return text")
     return RenderedCall(text=text, token_ids=_as_token_ids(token_ids))
+
+
+def _render_messages(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    tools: Sequence[Any],
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> RenderedCall:
+    kwargs: JSONDict = {
+        "conversation": normalize_messages(messages),
+        "tokenize": False,
+        "add_generation_prompt": add_generation_prompt,
+        "enable_thinking": enable_thinking,
+    }
+    if tools:
+        kwargs["tools"] = list(tools)
+    text = tokenizer.apply_chat_template(**kwargs)
+    token_ids = tokenizer.apply_chat_template(**{**kwargs, "tokenize": True})
+    if not isinstance(text, str):
+        raise TypeError("chat template did not return text")
+    return RenderedCall(text=text, token_ids=_as_token_ids(token_ids))
+
+
+def _response_message(call: Mapping[str, Any]) -> JSONDict:
+    response = call.get("response") or {}
+    if not isinstance(response, Mapping):
+        raise ValueError("logged response is not a JSON object")
+    message: JSONDict = {
+        "role": "assistant",
+        "content": copy.deepcopy(response.get("content")),
+    }
+    normalized_calls: list[JSONDict] = []
+    for tool_call in response.get("tool_calls") or []:
+        if not isinstance(tool_call, Mapping):
+            continue
+        name = _tool_name(tool_call)
+        if name is None:
+            continue
+        arguments = _tool_arguments(tool_call)
+        function = tool_call.get("function")
+        raw_arguments = (
+            function.get("arguments") if isinstance(function, Mapping) else None
+        )
+        if arguments is None and isinstance(raw_arguments, str):
+            rendered_arguments: Any = raw_arguments
+        else:
+            rendered_arguments = arguments or {}
+        value: JSONDict = {
+            "type": "function",
+            "function": {"name": name, "arguments": rendered_arguments},
+        }
+        if (call_id := _tool_call_id(tool_call)) is not None:
+            value["id"] = call_id
+        normalized_calls.append(value)
+    if normalized_calls:
+        message["tool_calls"] = normalized_calls
+    return message
+
+
+def _find_subsequence_or_none(
+    values: Sequence[int], target: Sequence[int], *, start: int = 0
+) -> int | None:
+    if not target:
+        return None
+    stop = len(values) - len(target) + 1
+    for index in range(start, stop):
+        if tuple(values[index : index + len(target)]) == tuple(target):
+            return index
+    return None
+
+
+def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
+    length = 0
+    for left_id, right_id in zip(left, right, strict=False):
+        if left_id != right_id:
+            break
+        length += 1
+    return length
+
+
+def _flatten_argument_values(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    values: list[tuple[str, Any]] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            label = f"{prefix}.{key}" if prefix else str(key)
+            values.extend(_flatten_argument_values(item, label))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            label = f"{prefix}[{index}]"
+            values.extend(_flatten_argument_values(item, label))
+    else:
+        values.append((prefix or "value", value))
+    return values
+
+
+def _argument_token_candidates(tokenizer: Any, value: Any) -> list[tuple[int, ...]]:
+    texts = [
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(value, ensure_ascii=False),
+        str(value),
+    ]
+    candidates: list[tuple[int, ...]] = []
+    for text in dict.fromkeys(texts):
+        token_ids = _as_token_ids(tokenizer.encode(text, add_special_tokens=False))
+        if token_ids and token_ids not in candidates:
+            candidates.append(token_ids)
+    return candidates
+
+
+def render_actual_response(
+    tokenizer: Any, call: Mapping[str, Any], *, enable_thinking: bool
+) -> ReplayedResponse:
+    """Teacher-force the logged response and locate semantic token boundaries."""
+    request = call.get("request") or {}
+    if not isinstance(request, Mapping):
+        raise ValueError("logged request is not a JSON object")
+    messages = normalize_messages(request.get("messages") or [])
+    tools = request.get("tools") or []
+    pre_response = render_logged_call(
+        tokenizer, call, enable_thinking=enable_thinking
+    )
+    observation = _render_messages(
+        tokenizer,
+        messages,
+        tools=tools,
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+    )
+    response_message = _response_message(call)
+    response = _render_messages(
+        tokenizer,
+        [*messages, response_message],
+        tools=tools,
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+    )
+
+    observation_prefix = _common_prefix_length(
+        observation.token_ids, pre_response.token_ids
+    )
+    if observation_prefix == 0:
+        raise ValueError("observation context is not a prefix of the decision request")
+
+    boundaries = [
+        SemanticBoundary(
+            name="observation",
+            context="request",
+            position=observation_prefix - 1,
+        ),
+        SemanticBoundary(
+            name="decision",
+            context="request",
+            position=len(pre_response.token_ids) - 1,
+        ),
+    ]
+    spans: list[GeneratedSpan] = []
+    response_prefix = _common_prefix_length(observation.token_ids, response.token_ids)
+    search_start = max(0, response_prefix - 1)
+    response_calls = (call.get("response") or {}).get("tool_calls") or []
+    for tool_index, tool_call in enumerate(response_calls):
+        if not isinstance(tool_call, Mapping) or (name := _tool_name(tool_call)) is None:
+            continue
+        name_ids = _as_token_ids(tokenizer.encode(name, add_special_tokens=False))
+        name_start = _find_subsequence_or_none(
+            response.token_ids, name_ids, start=search_start
+        )
+        if name_start is None:
+            raise ValueError(f"tool name {name!r} was not found in logged response")
+        name_end = name_start + len(name_ids)
+        label = f"tool[{tool_index}]={name}"
+        spans.append(
+            GeneratedSpan(
+                kind="tool_name",
+                label=label,
+                start=name_start,
+                end=name_end,
+                token_ids=name_ids,
+            )
+        )
+        boundaries.append(
+            SemanticBoundary(
+                name="tool",
+                context="response",
+                position=name_start - 1,
+                label=label,
+            )
+        )
+
+        argument_search = name_end
+        arguments = _tool_arguments(tool_call)
+        for argument_label, value in _flatten_argument_values(arguments or {}):
+            match: tuple[int, tuple[int, ...]] | None = None
+            for token_ids in _argument_token_candidates(tokenizer, value):
+                start = _find_subsequence_or_none(
+                    response.token_ids, token_ids, start=argument_search
+                )
+                if start is not None and (match is None or start < match[0]):
+                    match = (start, token_ids)
+            if match is None:
+                continue
+            value_start, value_ids = match
+            value_end = value_start + len(value_ids)
+            span_label = f"tool[{tool_index}].{argument_label}"
+            spans.append(
+                GeneratedSpan(
+                    kind="argument_value",
+                    label=span_label,
+                    start=value_start,
+                    end=value_end,
+                    token_ids=value_ids,
+                )
+            )
+            boundaries.append(
+                SemanticBoundary(
+                    name="argument",
+                    context="response",
+                    position=value_start - 1,
+                    label=span_label,
+                )
+            )
+            argument_search = value_end
+        search_start = max(name_end, argument_search)
+
+    return ReplayedResponse(
+        request=pre_response,
+        response=response,
+        boundaries=tuple(boundaries),
+        generated_spans=tuple(spans),
+    )
 
 
 def _find_subsequence(
