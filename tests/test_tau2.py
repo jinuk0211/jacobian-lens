@@ -4,14 +4,19 @@ import pytest
 import torch
 
 from jlens.tau2 import (
+    LoggedCall,
+    Tau2Case,
     build_tool_candidate,
     candidate_tool_names,
     discover_agent_calls,
+    infer_first_error,
     load_cases,
     normalize_messages,
+    render_actual_response,
     render_logged_call,
     select_calls,
     select_cases,
+    select_event_calls,
     summarize_logits,
 )
 
@@ -44,8 +49,13 @@ class FakeTokenizer:
             rendered += f"<{message['role']}>"
             tool_calls = message.get("tool_calls") or []
             if tool_calls:
-                name = tool_calls[0]["function"]["name"]
-                rendered += f'<tool_call>{{"name":"{name}"}}'
+                for tool_call in tool_calls:
+                    function = tool_call["function"]
+                    name = function["name"]
+                    arguments = json.dumps(
+                        function.get("arguments") or {}, separators=(",", ":")
+                    )
+                    rendered += f'<tool_call>{{"name":"{name}","arguments":{arguments}}}'
             else:
                 rendered += message.get("content") or ""
         if add_generation_prompt:
@@ -222,6 +232,58 @@ def test_render_accepts_transformers_five_batch_encoding_shape():
     rendered = render_logged_call(tokenizer, sample_call(), enable_thinking=False)
 
     assert rendered.token_ids == tuple(tokenizer.encode(rendered.text))
+
+
+def test_render_actual_response_locates_semantic_boundaries_and_arguments():
+    replay = render_actual_response(
+        FakeTokenizer(), sample_call(), enable_thinking=False
+    )
+
+    assert [boundary.name for boundary in replay.boundaries] == [
+        "observation",
+        "decision",
+        "tool",
+        "argument",
+    ]
+    assert [span.kind for span in replay.generated_spans] == [
+        "tool_name",
+        "argument_value",
+    ]
+    assert replay.generated_spans[0].label == "tool[0]=get_reservation_details"
+    assert replay.generated_spans[1].label == "tool[0].reservation_id"
+    for span in replay.generated_spans:
+        assert replay.response.token_ids[span.start : span.end] == span.token_ids
+        assert len(span.prediction_positions) == len(span.token_ids)
+
+
+def test_infer_first_error_prefers_verified_schema_error_and_selects_history(tmp_path):
+    valid = sample_call()
+    valid["response"]["tool_calls"][0]["name"] = "cancel_reservation"
+    valid["response"]["tool_calls"][0]["arguments"] = {}
+    invalid = sample_call()
+    invalid["call_id"] = "call-2"
+    invalid["response"]["tool_calls"][0]["name"] = "invented_tool"
+    case = Tau2Case(
+        task_id="5",
+        simulation_id="failed",
+        reward=0.0,
+        expected_tools=("cancel_reservation",),
+        actual_tools=("cancel_reservation", "invented_tool"),
+        task={},
+        simulation={"reward_info": {"reward": 0.0}, "messages": []},
+    )
+    calls = [
+        LoggedCall(tmp_path / "a.json", valid, call_index=0),
+        LoggedCall(tmp_path / "b.json", invalid, call_index=1),
+    ]
+
+    event = infer_first_error(case, calls)
+
+    assert event is not None
+    assert event.call_index == 1
+    assert event.kind == "tool_schema_error"
+    assert event.confidence == "verified"
+    assert select_event_calls(calls, event.call_index, before=None, after=0) == calls
 
 
 def test_select_failures_last_call_and_candidate_tools(tmp_path):

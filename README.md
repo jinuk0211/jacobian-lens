@@ -81,8 +81,10 @@ like the one above.
 
 For replaying saved tau2-bench tool-agent failures, see
 [`TAU2_ANALYSIS.md`](TAU2_ANALYSIS.md). The included CLI reconstructs the exact
-logged chat template and compares expected and emitted tool names layer by
-layer.
+logged request and response, aligns full histories to the first verifiable
+error, pairs successful trajectories from the same task, reads out semantic
+observation/decision/tool/argument/update boundaries, and scores actual tool
+and argument tokens layer by layer.
 
 Reading a slice page:
 
