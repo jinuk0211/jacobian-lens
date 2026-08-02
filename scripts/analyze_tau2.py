@@ -1075,6 +1075,8 @@ def main() -> None:
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    failed_calls = sum(entry["status"] == "error" for entry in report)
+    successful_calls = len(report) - failed_calls
     print(f"Wrote {len(all_rows)} score rows to {scores_path}")
     print(
         f"Wrote {len(all_boundary_rows)} semantic-boundary rows to {boundary_path}"
@@ -1084,6 +1086,12 @@ def main() -> None:
         f"{generated_span_path}"
     )
     print(f"Per-call status: {report_path}")
+    print(f"Per-call result: {successful_calls} succeeded, {failed_calls} failed")
+    if failed_calls:
+        raise RuntimeError(
+            f"J-Lens analysis failed for {failed_calls}/{len(report)} selected calls; "
+            f"inspect {report_path}"
+        )
 
 
 if __name__ == "__main__":
