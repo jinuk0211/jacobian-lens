@@ -670,12 +670,34 @@ def discover_agent_calls(run_dir: str | Path, case: Tau2Case) -> list[LoggedCall
 
 
 def normalize_messages(messages: Sequence[Mapping[str, Any]]) -> list[JSONDict]:
-    """Undo tau2's newline-splitting transformation without mutating input."""
+    """Normalize tau2/OpenAI messages without mutating the saved log.
+
+    OpenAI-compatible logs keep historical function arguments as JSON strings,
+    while Hugging Face chat templates (notably Qwen3.5) expect mappings.  Parse
+    valid object strings before replaying the conversation; Qwen3 already
+    accepts the resulting canonical representation.
+    """
     normalized: list[JSONDict] = []
     for message in messages:
         value = copy.deepcopy(dict(message))
         if isinstance(value.get("content"), list):
             value["content"] = "\n".join(str(line) for line in value["content"])
+        tool_calls = value.get("tool_calls")
+        if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, str):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                container = function if isinstance(function, dict) else tool_call
+                arguments = container.get("arguments")
+                if not isinstance(arguments, str):
+                    continue
+                try:
+                    parsed = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, Mapping):
+                    container["arguments"] = dict(parsed)
         normalized.append(value)
     return normalized
 
@@ -758,13 +780,12 @@ def _response_message(call: Mapping[str, Any]) -> JSONDict:
             continue
         arguments = _tool_arguments(tool_call)
         function = tool_call.get("function")
-        raw_arguments = (
-            function.get("arguments") if isinstance(function, Mapping) else None
-        )
-        if arguments is None and isinstance(raw_arguments, str):
-            rendered_arguments: Any = raw_arguments
-        else:
-            rendered_arguments = arguments or {}
+        raw_arguments = tool_call.get("arguments")
+        if raw_arguments is None and isinstance(function, Mapping):
+            raw_arguments = function.get("arguments")
+        if arguments is None and raw_arguments is not None:
+            raise ValueError(f"arguments for {name!r} are not a JSON object")
+        rendered_arguments = arguments or {}
         value: JSONDict = {
             "type": "function",
             "function": {"name": name, "arguments": rendered_arguments},
@@ -787,6 +808,113 @@ def _find_subsequence_or_none(
         if tuple(values[index : index + len(target)]) == tuple(target):
             return index
     return None
+
+
+def _token_offsets(
+    tokenizer: Any, rendered: RenderedCall
+) -> tuple[tuple[int, int], ...] | None:
+    """Return offsets when re-tokenization exactly matches the rendered IDs."""
+    try:
+        encoded = tokenizer(
+            rendered.text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except (TypeError, ValueError, NotImplementedError):
+        return None
+    if not isinstance(encoded, Mapping) or "offset_mapping" not in encoded:
+        return None
+    try:
+        input_ids = _as_token_ids(encoded)
+    except TypeError:
+        return None
+    raw_offsets = encoded["offset_mapping"]
+    if hasattr(raw_offsets, "tolist"):
+        raw_offsets = raw_offsets.tolist()
+    if (
+        isinstance(raw_offsets, list)
+        and len(raw_offsets) == 1
+        and isinstance(raw_offsets[0], list)
+    ):
+        raw_offsets = raw_offsets[0]
+    if not isinstance(raw_offsets, list):
+        return None
+    try:
+        offsets = tuple((int(pair[0]), int(pair[1])) for pair in raw_offsets)
+    except (IndexError, TypeError, ValueError):
+        return None
+    if input_ids != rendered.token_ids or len(offsets) != len(rendered.token_ids):
+        return None
+    return offsets
+
+
+def _token_span_for_chars(
+    tokenizer: Any,
+    rendered: RenderedCall,
+    char_start: int,
+    char_end: int,
+    *,
+    token_start: int,
+) -> tuple[int, int] | None:
+    offsets = _token_offsets(tokenizer, rendered)
+    if offsets is not None:
+        matching = [
+            index
+            for index, (start, end) in enumerate(offsets)
+            if end > char_start and start < char_end
+        ]
+        if matching:
+            return matching[0], matching[-1] + 1
+
+    target_ids = _as_token_ids(
+        tokenizer.encode(
+            rendered.text[char_start:char_end], add_special_tokens=False
+        )
+    )
+    found = _find_subsequence_or_none(
+        rendered.token_ids, target_ids, start=token_start
+    )
+    return None if found is None else (found, found + len(target_ids))
+
+
+def _tool_name_char_span(text: str, name: str, *, start: int) -> tuple[int, int]:
+    structured = (
+        (f"<function={name}>", len("<function=")),
+        (f'"name":"{name}"', len('"name":"')),
+        (f'"name": "{name}"', len('"name": "')),
+    )
+    for pattern, name_offset in structured:
+        pattern_start = text.find(pattern, start)
+        if pattern_start >= 0:
+            name_start = pattern_start + name_offset
+            return name_start, name_start + len(name)
+    name_start = text.find(name, start)
+    if name_start < 0:
+        raise ValueError(f"tool name {name!r} was not found in rendered text")
+    return name_start, name_start + len(name)
+
+
+def _tool_name_token_span(
+    tokenizer: Any,
+    rendered: RenderedCall,
+    name: str,
+    *,
+    char_start: int,
+    token_start: int,
+) -> tuple[int, int, int]:
+    name_char_start, name_char_end = _tool_name_char_span(
+        rendered.text, name, start=char_start
+    )
+    token_span = _token_span_for_chars(
+        tokenizer,
+        rendered,
+        name_char_start,
+        name_char_end,
+        token_start=token_start,
+    )
+    if token_span is None:
+        raise ValueError(f"tool name {name!r} has no matching rendered token span")
+    return token_span[0], token_span[1], name_char_end
 
 
 def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
@@ -875,18 +1003,21 @@ def render_actual_response(
     ]
     spans: list[GeneratedSpan] = []
     response_prefix = _common_prefix_length(observation.token_ids, response.token_ids)
+    response_char_prefix = _common_prefix_length(observation.text, response.text)
     search_start = max(0, response_prefix - 1)
+    search_char_start = max(0, response_char_prefix - 1)
     response_calls = (call.get("response") or {}).get("tool_calls") or []
     for tool_index, tool_call in enumerate(response_calls):
         if not isinstance(tool_call, Mapping) or (name := _tool_name(tool_call)) is None:
             continue
-        name_ids = _as_token_ids(tokenizer.encode(name, add_special_tokens=False))
-        name_start = _find_subsequence_or_none(
-            response.token_ids, name_ids, start=search_start
+        name_start, name_end, name_char_end = _tool_name_token_span(
+            tokenizer,
+            response,
+            name,
+            char_start=search_char_start,
+            token_start=search_start,
         )
-        if name_start is None:
-            raise ValueError(f"tool name {name!r} was not found in logged response")
-        name_end = name_start + len(name_ids)
+        name_ids = response.token_ids[name_start:name_end]
         label = f"tool[{tool_index}]={name}"
         spans.append(
             GeneratedSpan(
@@ -940,6 +1071,7 @@ def render_actual_response(
             )
             argument_search = value_end
         search_start = max(name_end, argument_search)
+        search_char_start = name_char_end
 
     return ReplayedResponse(
         request=pre_response,
@@ -994,21 +1126,21 @@ def build_tool_candidate(
     token_ids = _as_token_ids(
         tokenizer.apply_chat_template(**{**kwargs, "tokenize": True})
     )
-    name_token_ids = _as_token_ids(
-        tokenizer.encode(tool_name, add_special_tokens=False)
+    if not isinstance(text, str):
+        raise TypeError("chat template did not return text")
+    rendered = RenderedCall(text=text, token_ids=token_ids)
+    base = render_logged_call(tokenizer, call, enable_thinking=enable_thinking)
+    name_start, name_end, _ = _tool_name_token_span(
+        tokenizer,
+        rendered,
+        tool_name,
+        char_start=max(0, _common_prefix_length(base.text, text) - 1),
+        token_start=max(0, _common_prefix_length(base.token_ids, token_ids) - 1),
     )
-    base_length = len(
-        render_logged_call(tokenizer, call, enable_thinking=enable_thinking).token_ids
-    )
-    name_start = _find_subsequence(
-        token_ids, name_token_ids, start=max(0, base_length - 1)
-    )
-    name_end = name_start + len(name_token_ids)
+    name_token_ids = token_ids[name_start:name_end]
     prediction_positions = tuple(range(name_start - 1, name_end - 1))
     if prediction_positions[0] < 0:
         raise ValueError("tool name has no preceding token to score")
-    if not isinstance(text, str):
-        raise TypeError("chat template did not return text")
     return ToolCandidate(
         name=tool_name,
         text=text,

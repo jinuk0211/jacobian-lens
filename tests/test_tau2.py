@@ -73,6 +73,76 @@ class MappingTokenizer(FakeTokenizer):
         return {"input_ids": value} if kwargs.get("tokenize") else value
 
 
+class ContextMergingTokenizer:
+    """Qwen3.5-like XML template whose tool-name token includes its context."""
+
+    def __init__(self):
+        self._piece_to_id = {}
+        self._id_to_piece = {}
+
+    def _piece_id(self, piece):
+        if piece not in self._piece_to_id:
+            token_id = 256 + len(self._piece_to_id)
+            self._piece_to_id[piece] = token_id
+            self._id_to_piece[token_id] = piece
+        return self._piece_to_id[piece]
+
+    def _tokenize(self, text):
+        pieces = []
+        index = 0
+        while index < len(text):
+            if text.startswith("<function=", index):
+                end = text.index(">", index) + 1
+                pieces.append((text[index:end], index, end))
+                index = end
+            else:
+                pieces.append((text[index], index, index + 1))
+                index += 1
+        return pieces
+
+    def encode(self, text, *, add_special_tokens=False):
+        del add_special_tokens
+        return [self._piece_id(piece) for piece, _, _ in self._tokenize(text)]
+
+    def decode(self, token_ids, **kwargs):
+        del kwargs
+        return "".join(self._id_to_piece[token_id] for token_id in token_ids)
+
+    def __call__(self, text, *, add_special_tokens=False, return_offsets_mapping=False):
+        del add_special_tokens
+        pieces = self._tokenize(text)
+        value = {"input_ids": [self._piece_id(piece) for piece, _, _ in pieces]}
+        if return_offsets_mapping:
+            value["offset_mapping"] = [(start, end) for _, start, end in pieces]
+        return value
+
+    def apply_chat_template(
+        self,
+        conversation,
+        *,
+        tools=None,
+        tokenize=False,
+        add_generation_prompt=False,
+        **kwargs,
+    ):
+        del tools, kwargs
+        rendered = ""
+        for message in conversation:
+            rendered += f"<{message['role']}>" + (message.get("content") or "")
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call.get("function") or tool_call
+                arguments = function.get("arguments") or {}
+                if not isinstance(arguments, dict):
+                    raise TypeError("Can only get item pairs from a mapping.")
+                rendered += f"<tool_call><function={function['name']}>"
+                for name, value in arguments.items():
+                    rendered += f"<parameter={name}>{value}</parameter>"
+                rendered += "</function></tool_call>"
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return self.encode(rendered) if tokenize else rendered
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -202,6 +272,33 @@ def test_normalize_messages_restores_logged_multiline_content():
     assert messages[0]["content"] == ["policy line 1", "line 2"]
 
 
+def test_normalize_messages_parses_openai_tool_argument_strings():
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_booking",
+                        "arguments": '{"booking_id":"ABC123"}',
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = normalize_messages(messages)
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+        "booking_id": "ABC123"
+    }
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        '{"booking_id":"ABC123"}'
+    )
+
+
 def test_render_and_tool_candidate_use_the_chat_template():
     tokenizer = FakeTokenizer()
     call = sample_call()
@@ -254,6 +351,39 @@ def test_render_actual_response_locates_semantic_boundaries_and_arguments():
     for span in replay.generated_spans:
         assert replay.response.token_ids[span.start : span.end] == span.token_ids
         assert len(span.prediction_positions) == len(span.token_ids)
+
+
+def test_qwen35_style_template_handles_history_and_context_merged_tool_name():
+    tokenizer = ContextMergingTokenizer()
+    call = sample_call()
+    call["request"]["messages"].append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_booking",
+                        "arguments": '{"booking_id":"ABC123"}',
+                    },
+                }
+            ],
+        }
+    )
+    call["request"]["messages"].append(
+        {"role": "tool", "content": '{"status":"ok"}'}
+    )
+
+    replay = render_actual_response(tokenizer, call, enable_thinking=False)
+    candidate = build_tool_candidate(
+        tokenizer, call, "cancel_reservation", enable_thinking=False
+    )
+
+    tool_span = next(span for span in replay.generated_spans if span.kind == "tool_name")
+    assert "get_reservation_details" in tokenizer.decode(tool_span.token_ids)
+    assert "cancel_reservation" in tokenizer.decode(candidate.name_token_ids)
+    assert tuple(tokenizer.encode("cancel_reservation")) != candidate.name_token_ids
 
 
 def test_infer_first_error_prefers_verified_schema_error_and_selects_history(tmp_path):
