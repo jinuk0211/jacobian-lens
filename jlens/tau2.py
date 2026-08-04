@@ -672,18 +672,26 @@ def discover_agent_calls(run_dir: str | Path, case: Tau2Case) -> list[LoggedCall
 def normalize_messages(messages: Sequence[Mapping[str, Any]]) -> list[JSONDict]:
     """Normalize tau2/OpenAI messages without mutating the saved log.
 
-    OpenAI-compatible logs keep historical function arguments as JSON strings,
-    while Hugging Face chat templates (notably Qwen3.5) expect mappings.  Parse
-    valid object strings before replaying the conversation; Qwen3 already
-    accepts the resulting canonical representation.
+    OpenAI-compatible logs keep nullable assistant fields and historical
+    function arguments as JSON strings, while Hugging Face chat templates
+    expect omitted empty tool calls, string content, and argument mappings.
+    Restore that canonical representation before replaying the conversation.
     """
     normalized: list[JSONDict] = []
     for message in messages:
         value = copy.deepcopy(dict(message))
         if isinstance(value.get("content"), list):
             value["content"] = "\n".join(str(line) for line in value["content"])
+        elif value.get("role") == "assistant" and value.get("content") is None:
+            value["content"] = ""
         tool_calls = value.get("tool_calls")
-        if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, str):
+        if tool_calls is None or (
+            isinstance(tool_calls, Sequence)
+            and not isinstance(tool_calls, str)
+            and not tool_calls
+        ):
+            value.pop("tool_calls", None)
+        elif isinstance(tool_calls, Sequence) and not isinstance(tool_calls, str):
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
@@ -1105,7 +1113,7 @@ def build_tool_candidate(
     messages = normalize_messages(request.get("messages") or [])
     candidate_message = {
         "role": "assistant",
-        "content": None,
+        "content": "",
         "tool_calls": [
             {
                 "type": "function",

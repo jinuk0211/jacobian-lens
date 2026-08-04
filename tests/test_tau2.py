@@ -73,6 +73,20 @@ class MappingTokenizer(FakeTokenizer):
         return {"input_ids": value} if kwargs.get("tokenize") else value
 
 
+class GptOssShapeTokenizer(FakeTokenizer):
+    """Reject nullable assistant fields that the GPT-OSS template cannot render."""
+
+    def apply_chat_template(self, conversation, **kwargs):
+        for message in conversation:
+            if message["role"] != "assistant":
+                continue
+            if not isinstance(message.get("content", ""), str):
+                raise TypeError("assistant content must be a string when present")
+            if "tool_calls" in message and not message["tool_calls"]:
+                raise TypeError("assistant tool_calls must be non-empty when present")
+        return super().apply_chat_template(conversation, **kwargs)
+
+
 class ContextMergingTokenizer:
     """Qwen3.5-like XML template whose tool-name token includes its context."""
 
@@ -329,6 +343,41 @@ def test_render_accepts_transformers_five_batch_encoding_shape():
     rendered = render_logged_call(tokenizer, sample_call(), enable_thinking=False)
 
     assert rendered.token_ids == tuple(tokenizer.encode(rendered.text))
+
+
+def test_gpt_oss_style_template_handles_nullable_openai_assistant_fields():
+    tokenizer = GptOssShapeTokenizer()
+    call = sample_call()
+    call["request"]["messages"].extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_reservation_details",
+                            "arguments": '{"reservation_id":"ABC123"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": '{"status":"ok"}'},
+            {"role": "assistant", "content": "Booking found", "tool_calls": None},
+            {"role": "user", "content": "Cancel it"},
+        ]
+    )
+
+    replay = render_actual_response(tokenizer, call, enable_thinking=False)
+    candidate = build_tool_candidate(
+        tokenizer, call, "cancel_reservation", enable_thinking=False
+    )
+
+    assert replay.response.token_ids
+    assert candidate.name_token_ids
+    assert call["request"]["messages"][2]["content"] is None
+    assert call["request"]["messages"][4]["tool_calls"] is None
 
 
 def test_render_actual_response_locates_semantic_boundaries_and_arguments():
